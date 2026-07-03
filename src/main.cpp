@@ -6,11 +6,11 @@
 // PIN DEFINITIONS
 // ============================================================
 
-#define SDA_CONVEYOR_SENSOR     21
-#define SCL_CONVEYOR_SENSOR     22
+#define SDA_CONVEYOR_SENSOR     9
+#define SCL_CONVEYOR_SENSOR     10
 
-#define MOTOR_CONVEYOR_FORWARD  26
-#define MOTOR_CONVEYOR_BACKWARD 27
+#define MOTOR_CONVEYOR_FORWARD  11
+#define MOTOR_CONVEYOR_BACKWARD 12
 
 // ============================================================
 // SENSOR / FILTER CONFIGURATION
