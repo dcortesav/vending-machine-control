@@ -34,6 +34,14 @@ const float DISTANCE_UPPER_LIMIT = 600.0f;  // mm
 const float DISTANCE_LOWER_LIMIT = 60.0f;   // mm
 
 // ============================================================
+// TRANSITION LOCKOUT CONFIGURATION
+// ============================================================
+// When leaving ARRIVED (box picked up / removed), the sensor reading
+// sweeps through the MOVING zone on its way to IDLE. This lockout
+// window blocks the motor from reacting to that transient sweep.
+const unsigned long LOCKOUT_DURATION_MS = 700; // 500-1000 ms recommended
+
+// ============================================================
 // GLOBALS
 // ============================================================
 
@@ -56,6 +64,19 @@ enum MotorState : uint8_t
 };
 
 MotorState currentMotorState = MOTOR_STOPPED;
+
+// System-level state machine (independent from MotorState, which only
+// tracks the physical GPIO output). This is what implements the fix.
+enum SystemState : uint8_t
+{
+    STATE_IDLE,     // distance >= DISTANCE_UPPER_LIMIT, motor stopped
+    STATE_MOVING,   // LOWER < distance < UPPER, motor running backward
+    STATE_ARRIVED,  // distance <= DISTANCE_LOWER_LIMIT, motor stopped
+    STATE_LOCKOUT   // just left ARRIVED; ignoring transient MOVING readings
+};
+
+SystemState currentState = STATE_IDLE;
+unsigned long lockoutStartTime = 0;
 
 // ============================================================
 // FILTERING HELPERS
@@ -162,21 +183,94 @@ void motorBackward()
     }
 }
 
-// Applies the three-zone control logic to a calibrated distance reading.
-void updateMotorFromDistance(float calibratedDistance)
+// ============================================================
+// STATE MACHINE
+// ============================================================
+//
+// Normal transitions (IDLE <-> MOVING <-> ARRIVED) happen immediately.
+// The only guarded transition is ARRIVED -> (MOVING/IDLE): leaving
+// ARRIVED always routes through LOCKOUT first, which suppresses the
+// MOVING zone for LOCKOUT_DURATION_MS. Reaching IDLE (>= upper limit)
+// is inherently safe (motor stays stopped) so it's allowed to confirm
+// immediately and exit the lockout early.
+void updateStateMachine(float d, unsigned long now)
 {
-    if (calibratedDistance >= DISTANCE_UPPER_LIMIT)
+    switch (currentState)
     {
-        motorStop();
+        case STATE_IDLE:
+            if (d <= DISTANCE_LOWER_LIMIT)
+                currentState = STATE_ARRIVED;
+            else if (d < DISTANCE_UPPER_LIMIT)
+                currentState = STATE_MOVING;
+            break;
+
+        case STATE_MOVING:
+            if (d <= DISTANCE_LOWER_LIMIT)
+                currentState = STATE_ARRIVED;
+            else if (d >= DISTANCE_UPPER_LIMIT)
+                currentState = STATE_IDLE;
+            break;
+
+        case STATE_ARRIVED:
+            if (d > DISTANCE_LOWER_LIMIT)
+            {
+                // Box picked up / removed: don't trust the reading yet.
+                currentState = STATE_LOCKOUT;
+                lockoutStartTime = now;
+            }
+            break;
+
+        case STATE_LOCKOUT:
+            if (d <= DISTANCE_LOWER_LIMIT)
+            {
+                // False alarm / bounce - box is still there.
+                currentState = STATE_ARRIVED;
+            }
+            else if (d >= DISTANCE_UPPER_LIMIT)
+            {
+                // Confirmed clear all the way to IDLE - safe to exit early.
+                currentState = STATE_IDLE;
+            }
+            else if (now - lockoutStartTime >= LOCKOUT_DURATION_MS)
+            {
+                // Cooldown expired and reading is still in the MOVING
+                // zone -> this is now trusted as a genuine new object.
+                currentState = STATE_MOVING;
+            }
+            // else: still within cooldown and still in the MOVING zone
+            // -> stay in LOCKOUT, motor remains stopped.
+            break;
     }
-    else if (calibratedDistance > DISTANCE_LOWER_LIMIT &&
-             calibratedDistance < DISTANCE_UPPER_LIMIT)
+}
+
+// Human-readable state name for debug logging.
+const char *stateName(SystemState state)
+{
+    switch (state)
     {
-        motorBackward();
+        case STATE_IDLE:    return "IDLE";
+        case STATE_MOVING:  return "MOVING";
+        case STATE_ARRIVED: return "ARRIVED";
+        case STATE_LOCKOUT: return "LOCKOUT";
+        default:            return "UNKNOWN";
     }
-    else // calibratedDistance <= DISTANCE_LOWER_LIMIT
+}
+
+// Maps the current system state to the physical motor output.
+void applyMotorForState()
+{
+    switch (currentState)
     {
-        motorStop();
+        case STATE_MOVING:
+            motorBackward();
+            break;
+
+        case STATE_IDLE:
+        case STATE_ARRIVED:
+        case STATE_LOCKOUT:
+        default:
+            motorStop();
+            break;
     }
 }
 
@@ -242,6 +336,11 @@ void loop()
     }
 
     float calibratedDistance = filtered - CALIBRATION_OFFSET;
+    unsigned long now = millis();
+
+    SystemState previousState = currentState;
+    updateStateMachine(calibratedDistance, now);
+    applyMotorForState();
 
     Serial.print("Raw: ");
     Serial.print(distance);
@@ -249,7 +348,13 @@ void loop()
     Serial.print(filtered);
     Serial.print(" mm   Calibrated: ");
     Serial.print(calibratedDistance);
-    Serial.println(" mm");
+    Serial.print(" mm   State: ");
+    Serial.print(stateName(currentState));
 
-    updateMotorFromDistance(calibratedDistance);
+    if (currentState == STATE_LOCKOUT && previousState != STATE_LOCKOUT)
+    {
+        Serial.print(" (lockout started)");
+    }
+
+    Serial.println();
 }
