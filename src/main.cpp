@@ -12,6 +12,10 @@
 #define MOTOR_CONVEYOR_FORWARD  11
 #define MOTOR_CONVEYOR_BACKWARD 12
 
+#define LIMIT_SWITCH_MOTOR_MECHANISM 48
+#define LIMIT_SWITCH_CNC_X 47
+#define LIMIT_SWITCH_CNC_Y 21
+
 // ============================================================
 // SENSOR / FILTER CONFIGURATION
 // ============================================================
@@ -283,6 +287,10 @@ void setup()
     Serial.begin(115200);
     delay(50);
 
+    // --- Deactivate built-in led ---
+    pinMode(BUILTIN_LED,OUTPUT);
+    digitalWrite(BUILTIN_LED,LOW);
+
     // --- Motor pins ---
     pinMode(MOTOR_CONVEYOR_FORWARD, OUTPUT);
     pinMode(MOTOR_CONVEYOR_BACKWARD, OUTPUT);
@@ -307,6 +315,9 @@ void setup()
     sensor.startContinuous(50);
 
     Serial.println("Sensor listo. Sistema iniciado.");
+
+    pinMode(LIMIT_SWITCH_MOTOR_MECHANISM, INPUT_PULLDOWN);
+    
 }
 
 // ============================================================
@@ -342,9 +353,7 @@ void loop()
     updateStateMachine(calibratedDistance, now);
     applyMotorForState();
 
-    Serial.print("Raw: ");
-    Serial.print(distance);
-    Serial.print(" mm   Filtered: ");
+    Serial.print("Filtered: ");
     Serial.print(filtered);
     Serial.print(" mm   Calibrated: ");
     Serial.print(calibratedDistance);
