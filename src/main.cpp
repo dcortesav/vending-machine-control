@@ -1,369 +1,197 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <VL53L0X.h>
+#include <AccelStepper.h>
 
-// ============================================================
-// PIN DEFINITIONS
-// ============================================================
+#define EN_PIN_Y   4
+#define STEP_PIN_Y 5
+#define DIR_PIN_Y  6
 
-#define SDA_CONVEYOR_SENSOR     9
-#define SCL_CONVEYOR_SENSOR     10
+#define EN_PIN_X   7
+#define STEP_PIN_X 15
+#define DIR_PIN_X  16
 
-#define MOTOR_CONVEYOR_FORWARD  11
-#define MOTOR_CONVEYOR_BACKWARD 12
-
-#define LIMIT_SWITCH_MOTOR_MECHANISM 48
 #define LIMIT_SWITCH_CNC_X 47
 #define LIMIT_SWITCH_CNC_Y 21
 
-// ============================================================
-// SENSOR / FILTER CONFIGURATION
-// ============================================================
+const float PASOS_POR_MM = 20.0;
+const unsigned long TIEMPO_EN_CELDA = 2000; // 3 segundos
 
-const uint16_t MAX_VALID_DISTANCE = 1000;   // mm, discard readings above this
-const uint8_t  MEDIAN_SIZE        = 5;
-const uint8_t  AVERAGE_SIZE       = 5;
+AccelStepper motorX(AccelStepper::DRIVER, STEP_PIN_X, DIR_PIN_X);
+AccelStepper motorY(AccelStepper::DRIVER, STEP_PIN_Y, DIR_PIN_Y);
 
-// Calibration offset applied to the filtered distance
-const float CALIBRATION_OFFSET = 50.0f;
-
-// ============================================================
-// CONTROL LOOP THRESHOLDS (on calibrated distance)
-// ============================================================
-//   calibratedDistance >= DISTANCE_UPPER_LIMIT           -> STOP
-//   DISTANCE_LOWER_LIMIT < calibratedDistance < UPPER     -> RUN BACKWARD
-//   calibratedDistance <= DISTANCE_LOWER_LIMIT            -> STOP
-
-const float DISTANCE_UPPER_LIMIT = 600.0f;  // mm
-const float DISTANCE_LOWER_LIMIT = 60.0f;   // mm
-
-// ============================================================
-// TRANSITION LOCKOUT CONFIGURATION
-// ============================================================
-// When leaving ARRIVED (box picked up / removed), the sensor reading
-// sweeps through the MOVING zone on its way to IDLE. This lockout
-// window blocks the motor from reacting to that transient sweep.
-const unsigned long LOCKOUT_DURATION_MS = 700; // 500-1000 ms recommended
-
-// ============================================================
-// GLOBALS
-// ============================================================
-
-VL53L0X sensor;
-
-uint16_t medianBuffer[MEDIAN_SIZE];
-uint16_t averageBuffer[AVERAGE_SIZE];
-
-uint8_t medianIndex  = 0;
-uint8_t averageIndex = 0;
-
-bool medianFilled  = false;
-bool averageFilled = false;
-
-enum MotorState : uint8_t
-{
-    MOTOR_STOPPED,
-    MOTOR_FORWARD,
-    MOTOR_BACKWARD
+struct Celda {
+  float x_mm;
+  float y_mm;
 };
 
-MotorState currentMotorState = MOTOR_STOPPED;
+const int FILAS = 5;
+const int COLUMNAS = 6;
 
-// System-level state machine (independent from MotorState, which only
-// tracks the physical GPIO output). This is what implements the fix.
-enum SystemState : uint8_t
-{
-    STATE_IDLE,     // distance >= DISTANCE_UPPER_LIMIT, motor stopped
-    STATE_MOVING,   // LOWER < distance < UPPER, motor running backward
-    STATE_ARRIVED,  // distance <= DISTANCE_LOWER_LIMIT, motor stopped
-    STATE_LOCKOUT   // just left ARRIVED; ignoring transient MOVING readings
+Celda matrizCeldas[FILAS][COLUMNAS] = {
+  // Fila 1
+  {{22, 10}, {112, 10}, {202, 10}, {293, 10}, {384, 10}, {474, 10}}, 
+  // Fila 2
+  {{21, 150}, {112, 150}, {203, 150}, {293, 150}, {385, 150}, {477, 150}},
+  // Fila 3
+  {{20, 290}, {110, 290}, {201, 290}, {294, 290}, {386, 290}, {477, 290}},
+  // Fila 4
+  {{18, 430}, {108, 430}, {201, 430}, {293, 430}, {386, 430}, {477, 430}},
+  // Fila 5
+  {{16, 570}, {108, 570}, {201, 570}, {293, 570}, {385, 570}, {477, 570}},
 };
 
-SystemState currentState = STATE_IDLE;
-unsigned long lockoutStartTime = 0;
+// ==========================================
+// DEFINICIÓN DE FUNCIONES (DE ARRIBA A ABAJO)
+// ==========================================
 
-// ============================================================
-// FILTERING HELPERS
-// ============================================================
-
-uint16_t median(uint16_t *array, uint8_t size)
-{
-    uint16_t temp[size];
-    memcpy(temp, array, sizeof(uint16_t) * size);
-
-    for (uint8_t i = 0; i < size - 1; i++)
-    {
-        for (uint8_t j = i + 1; j < size; j++)
-        {
-            if (temp[j] < temp[i])
-            {
-                uint16_t t = temp[i];
-                temp[i] = temp[j];
-                temp[j] = t;
-            }
-        }
-    }
-
-    return temp[size / 2];
+void habilitarMotores() {
+  digitalWrite(EN_PIN_X, LOW);
+  digitalWrite(EN_PIN_Y, LOW);
+  delay(50);
 }
 
-float movingAverage(uint16_t *array, uint8_t size)
-{
-    uint32_t sum = 0;
-    for (uint8_t i = 0; i < size; i++)
-        sum += array[i];
-
-    return (float)sum / size;
+void deshabilitarMotores() {
+  digitalWrite(EN_PIN_X, HIGH);
+  digitalWrite(EN_PIN_Y, HIGH);
 }
 
-// Feeds a raw reading through the median -> moving-average pipeline.
-// Returns true and writes filteredDistance once both buffers are full.
-bool addMeasurement(uint16_t value, float &filteredDistance)
-{
-    medianBuffer[medianIndex] = value;
-    medianIndex++;
-
-    if (medianIndex >= MEDIAN_SIZE)
-    {
-        medianIndex = 0;
-        medianFilled = true;
-    }
-
-    if (!medianFilled)
-        return false;
-
-    uint16_t med = median(medianBuffer, MEDIAN_SIZE);
-
-    averageBuffer[averageIndex] = med;
-    averageIndex++;
-
-    if (averageIndex >= AVERAGE_SIZE)
-    {
-        averageIndex = 0;
-        averageFilled = true;
-    }
-
-    if (!averageFilled)
-        return false;
-
-    filteredDistance = movingAverage(averageBuffer, AVERAGE_SIZE);
-    return true;
+void esperarMovimiento() {
+  while (motorX.distanceToGo() != 0 || motorY.distanceToGo() != 0) {
+    motorX.run();
+    motorY.run();
+  }
 }
 
-// ============================================================
-// MOTOR CONTROL HELPERS
-// ============================================================
+void irAHome() {
+  habilitarMotores();
 
-void motorStop()
-{
-    if (currentMotorState != MOTOR_STOPPED)
-    {
-        digitalWrite(MOTOR_CONVEYOR_FORWARD, LOW);
-        digitalWrite(MOTOR_CONVEYOR_BACKWARD, LOW);
-        currentMotorState = MOTOR_STOPPED;
-        Serial.println("Motor: STOP");
-    }
+  // Reducir la velocidad temporalmente para el Homing
+  motorX.setMaxSpeed(1000); 
+  motorX.setAcceleration(10000);
+  motorY.setMaxSpeed(1000); 
+  motorY.setAcceleration(10000);
+
+  // === 1. HOMING EJE Y (Se ejecuta primero) ===
+  motorY.move(-100000); 
+
+  // Lógica Pull-Down: Reposo es LOW. Sale cuando detecta HIGH.
+  while (digitalRead(LIMIT_SWITCH_CNC_Y) == LOW) {
+    motorY.run();
+  }
+  
+  motorY.stop();
+  motorY.runToPosition(); 
+  motorY.setCurrentPosition(0); // Cero temporal en el switch
+  
+  // Retroceder 5 mm para liberar el sensor
+  motorY.moveTo(5 * PASOS_POR_MM);
+  motorY.runToPosition(); // Función bloqueante hasta alcanzar los 5mm
+  motorY.setCurrentPosition(0); // Este es ahora nuestro cero absoluto seguro en Y
+
+  // === 2. HOMING EJE X (Se ejecuta después de Y) ===
+  motorX.move(-100000); 
+  
+  while (digitalRead(LIMIT_SWITCH_CNC_X) == LOW) {
+    motorX.run();
+  }
+  
+  motorX.stop(); 
+  motorX.runToPosition(); 
+  motorX.setCurrentPosition(0); // Cero temporal en el switch
+  
+  // Retroceder 5 mm para liberar el sensor
+  motorX.moveTo(5 * PASOS_POR_MM);
+  motorX.runToPosition(); // Función bloqueante hasta alcanzar los 5mm
+  motorX.setCurrentPosition(0); // Este es ahora nuestro cero absoluto seguro en X
+
+  // Restaurar velocidades de trabajo
+  motorX.setMaxSpeed(4000);
+  motorX.setAcceleration(10000);
+  motorY.setMaxSpeed(4000);
+  motorY.setAcceleration(10000);
+
+  deshabilitarMotores();
+  Serial.println("Home establecido. Ejes liberados y en 0,0 seguro.");
 }
 
-void motorForward()
-{
-    if (currentMotorState != MOTOR_FORWARD)
-    {
-        digitalWrite(MOTOR_CONVEYOR_FORWARD, HIGH);
-        digitalWrite(MOTOR_CONVEYOR_BACKWARD, LOW);
-        currentMotorState = MOTOR_FORWARD;
-        Serial.println("Motor: FORWARD");
-    }
+void ejecutarCicloDeTrabajo(float targetX, float targetY) {
+  habilitarMotores();
+
+  long pasosX = targetX * PASOS_POR_MM;
+  long pasosY = targetY * PASOS_POR_MM;
+
+  motorX.moveTo(pasosX);
+  motorY.moveTo(pasosY);
+
+  esperarMovimiento();
+  Serial.println("Posicion alcanzada. Esperando...");
+
+  delay(TIEMPO_EN_CELDA);
+
+  Serial.println("Retornando a Home...");
+  irAHome();
 }
 
-void motorBackward()
-{
-    if (currentMotorState != MOTOR_BACKWARD)
-    {
-        digitalWrite(MOTOR_CONVEYOR_FORWARD, LOW);
-        digitalWrite(MOTOR_CONVEYOR_BACKWARD, HIGH);
-        currentMotorState = MOTOR_BACKWARD;
-        Serial.println("Motor: BACKWARD");
-    }
+void leerCeldaSerial() {
+  if (!Serial.available()) return;
+
+  String entrada = Serial.readStringUntil('\n');
+  entrada.trim();
+
+  if (entrada.length() != 2) {
+    Serial.println("Error: Formato invalido. Use 2 digitos (Ej: 42)");
+    return;
+  }
+
+  int columna = entrada.charAt(0) - '0';
+  int fila = entrada.charAt(1) - '0';
+
+  if (fila < 1 || fila > FILAS || columna < 1 || columna > COLUMNAS) {
+    Serial.println("Error: Celda fuera de rango (Filas: 1-6, Columnas: 1-5)");
+    return;
+  }
+
+  float targetX = matrizCeldas[fila - 1][columna - 1].x_mm;
+  float targetY = matrizCeldas[fila - 1][columna - 1].y_mm;
+
+  Serial.print("Comando recibido: "); Serial.print(entrada);
+  Serial.print(" -> Moviendo a X: "); Serial.print(targetX);
+  Serial.print("mm, Y: "); Serial.print(targetY); Serial.println("mm");
+
+  ejecutarCicloDeTrabajo(targetX, targetY);
 }
 
-// ============================================================
-// STATE MACHINE
-// ============================================================
-//
-// Normal transitions (IDLE <-> MOVING <-> ARRIVED) happen immediately.
-// The only guarded transition is ARRIVED -> (MOVING/IDLE): leaving
-// ARRIVED always routes through LOCKOUT first, which suppresses the
-// MOVING zone for LOCKOUT_DURATION_MS. Reaching IDLE (>= upper limit)
-// is inherently safe (motor stays stopped) so it's allowed to confirm
-// immediately and exit the lockout early.
-void updateStateMachine(float d, unsigned long now)
-{
-    switch (currentState)
-    {
-        case STATE_IDLE:
-            if (d <= DISTANCE_LOWER_LIMIT)
-                currentState = STATE_ARRIVED;
-            else if (d < DISTANCE_UPPER_LIMIT)
-                currentState = STATE_MOVING;
-            break;
+// ==========================================
+// FUNCIONES PRINCIPALES
+// ==========================================
 
-        case STATE_MOVING:
-            if (d <= DISTANCE_LOWER_LIMIT)
-                currentState = STATE_ARRIVED;
-            else if (d >= DISTANCE_UPPER_LIMIT)
-                currentState = STATE_IDLE;
-            break;
+void setup() {
+  Serial.begin(115200);
 
-        case STATE_ARRIVED:
-            if (d > DISTANCE_LOWER_LIMIT)
-            {
-                // Box picked up / removed: don't trust the reading yet.
-                currentState = STATE_LOCKOUT;
-                lockoutStartTime = now;
-            }
-            break;
+  pinMode(EN_PIN_X, OUTPUT);
+  pinMode(EN_PIN_Y, OUTPUT);
 
-        case STATE_LOCKOUT:
-            if (d <= DISTANCE_LOWER_LIMIT)
-            {
-                // False alarm / bounce - box is still there.
-                currentState = STATE_ARRIVED;
-            }
-            else if (d >= DISTANCE_UPPER_LIMIT)
-            {
-                // Confirmed clear all the way to IDLE - safe to exit early.
-                currentState = STATE_IDLE;
-            }
-            else if (now - lockoutStartTime >= LOCKOUT_DURATION_MS)
-            {
-                // Cooldown expired and reading is still in the MOVING
-                // zone -> this is now trusted as a genuine new object.
-                currentState = STATE_MOVING;
-            }
-            // else: still within cooldown and still in the MOVING zone
-            // -> stay in LOCKOUT, motor remains stopped.
-            break;
-    }
+  // Configuración de finales de carrera como INPUT normal (Pull-Down físico)
+  pinMode(LIMIT_SWITCH_CNC_X, INPUT_PULLDOWN);
+  pinMode(LIMIT_SWITCH_CNC_Y, INPUT_PULLDOWN);
+
+  // Invertir la dirección de los motores por software
+  motorX.setPinsInverted(true, false, false);
+  motorY.setPinsInverted(true, false, false);
+
+  motorX.setMaxSpeed(4000);
+  motorX.setAcceleration(10000);
+  motorY.setMaxSpeed(4000);
+  motorY.setAcceleration(10000);
+
+  deshabilitarMotores();
+
+  Serial.println("Iniciando sistema. Buscando Home...");
+  irAHome();
+
+  Serial.println("Sistema listo.");
+  Serial.println("Ingrese la celda de 2 digitos (FilaColumna). Ejemplo: 11, 42");
 }
 
-// Human-readable state name for debug logging.
-const char *stateName(SystemState state)
-{
-    switch (state)
-    {
-        case STATE_IDLE:    return "IDLE";
-        case STATE_MOVING:  return "MOVING";
-        case STATE_ARRIVED: return "ARRIVED";
-        case STATE_LOCKOUT: return "LOCKOUT";
-        default:            return "UNKNOWN";
-    }
-}
-
-// Maps the current system state to the physical motor output.
-void applyMotorForState()
-{
-    switch (currentState)
-    {
-        case STATE_MOVING:
-            motorBackward();
-            break;
-
-        case STATE_IDLE:
-        case STATE_ARRIVED:
-        case STATE_LOCKOUT:
-        default:
-            motorStop();
-            break;
-    }
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
-void setup()
-{
-    Serial.begin(115200);
-    delay(50);
-
-    // --- Deactivate built-in led ---
-    pinMode(BUILTIN_LED,OUTPUT);
-    digitalWrite(BUILTIN_LED,LOW);
-
-    // --- Motor pins ---
-    pinMode(MOTOR_CONVEYOR_FORWARD, OUTPUT);
-    pinMode(MOTOR_CONVEYOR_BACKWARD, OUTPUT);
-    digitalWrite(MOTOR_CONVEYOR_FORWARD, LOW);
-    digitalWrite(MOTOR_CONVEYOR_BACKWARD, LOW);
-
-    // --- Distance sensor ---
-    Wire.begin(SDA_CONVEYOR_SENSOR, SCL_CONVEYOR_SENSOR);
-
-    sensor.setTimeout(100);
-
-    if (!sensor.init())
-    {
-        Serial.println("VL53L0X no encontrado");
-        while (1)
-        {
-            // Halt: sensor is required for safe motor operation.
-        }
-    }
-
-    sensor.setMeasurementTimingBudget(50000);
-    sensor.startContinuous(50);
-
-    Serial.println("Sensor listo. Sistema iniciado.");
-
-    pinMode(LIMIT_SWITCH_MOTOR_MECHANISM, INPUT_PULLDOWN);
-    
-}
-
-// ============================================================
-// MAIN LOOP
-// ============================================================
-
-void loop()
-{
-    uint16_t distance = sensor.readRangeContinuousMillimeters();
-
-    if (sensor.timeoutOccurred())
-    {
-        Serial.println("Timeout");
-        motorStop(); // fail-safe: stop motor on sensor timeout
-        return;
-    }
-
-    if (distance > MAX_VALID_DISTANCE)
-    {
-        return; // discard absurd reading, keep previous motor state
-    }
-
-    float filtered;
-    if (!addMeasurement(distance, filtered))
-    {
-        return; // filter buffers not yet full
-    }
-
-    float calibratedDistance = filtered - CALIBRATION_OFFSET;
-    unsigned long now = millis();
-
-    SystemState previousState = currentState;
-    updateStateMachine(calibratedDistance, now);
-    applyMotorForState();
-
-    Serial.print("Filtered: ");
-    Serial.print(filtered);
-    Serial.print(" mm   Calibrated: ");
-    Serial.print(calibratedDistance);
-    Serial.print(" mm   State: ");
-    Serial.print(stateName(currentState));
-
-    if (currentState == STATE_LOCKOUT && previousState != STATE_LOCKOUT)
-    {
-        Serial.print(" (lockout started)");
-    }
-
-    Serial.println();
+void loop() {
+  leerCeldaSerial();
 }
