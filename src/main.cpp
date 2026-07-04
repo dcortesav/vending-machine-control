@@ -557,6 +557,16 @@ void ejecutarCicloDeTrabajo(float targetX, float targetY) {
     procesarBandaYMecanismo();
   }
 
+  // El mecanismo ya volvió a HOME, pero el CNC debe permanecer en la celda
+  // hasta que la banda confirme la llegada de la caja a su destino final
+  // (mismo estado STATE_ARRIVED de la máquina de estados existente).
+  // Se sigue llamando a procesarBandaYMecanismo() para que el sensor
+  // VL53L0X y la máquina de estados de la banda continúen actualizándose
+  // normalmente durante esta espera.
+  while (currentState != STATE_ARRIVED) {
+    procesarBandaYMecanismo();
+  }
+
   Serial.println("Retornando a Home...");
   irAHome();
 }
