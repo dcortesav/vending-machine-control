@@ -85,7 +85,7 @@ const float CALIBRATION_OFFSET = 50.0f;
 //   DISTANCE_LOWER_LIMIT < calibratedDistance < UPPER     -> RUN BACKWARD
 //   calibratedDistance <= DISTANCE_LOWER_LIMIT            -> STOP
 
-const float DISTANCE_UPPER_LIMIT = 500.0f;  // mm
+const float DISTANCE_UPPER_LIMIT = 450.0f;  // mm
 const float DISTANCE_LOWER_LIMIT = 60.0f;   // mm
 
 // ============================================================
@@ -94,7 +94,7 @@ const float DISTANCE_LOWER_LIMIT = 60.0f;   // mm
 const unsigned long LOCKOUT_DURATION_MS = 700; // 500-1000 ms recommended
 
 // Tiempo máximo de activación del mecanismo antes de obligar el retorno (configurable)
-const unsigned long MAX_MECH_DISPENSE_TIME_MS = 5800; // 5000 ms = 5 segundos
+const unsigned long MAX_MECH_DISPENSE_TIME_MS = 6000; // 5000 ms = 5 segundos
 
 // ============================================================
 // GLOBALS - CONVEYOR
@@ -509,9 +509,9 @@ void irAHome() {
   motorX.runToPosition();
   motorX.setCurrentPosition(0);
 
-  motorX.setMaxSpeed(4000);
+  motorX.setMaxSpeed(3000);
   motorX.setAcceleration(10000);
-  motorY.setMaxSpeed(4000);
+  motorY.setMaxSpeed(3000);
   motorY.setAcceleration(10000);
 
   deshabilitarMotores();
@@ -687,9 +687,9 @@ void setup() {
   motorX.setPinsInverted(true, false, false);
   motorY.setPinsInverted(true, false, false);
 
-  motorX.setMaxSpeed(4000);
+  motorX.setMaxSpeed(3000);
   motorX.setAcceleration(10000);
-  motorY.setMaxSpeed(4000);
+  motorY.setMaxSpeed(3000);
   motorY.setAcceleration(10000);
 
   deshabilitarMotores();
