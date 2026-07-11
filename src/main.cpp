@@ -93,8 +93,26 @@ const float DISTANCE_LOWER_LIMIT = 60.0f;   // mm
 // ============================================================
 const unsigned long LOCKOUT_DURATION_MS = 700; // 500-1000 ms recommended
 
-// Tiempo máximo de activación del mecanismo antes de obligar el retorno (configurable)
-const unsigned long MAX_MECH_DISPENSE_TIME_MS = 6000; // 5000 ms = 5 segundos
+// Cada celda puede contener entre 1 y 3 cajas colocadas en fila, una detrás
+// de otra. Cuanto menor sea el inventario restante, más lejos está la
+// primera caja disponible respecto del mecanismo, por lo que se necesita
+// más tiempo de avance para alcanzarla.
+const uint8_t MAX_CAJAS_POR_CELDA = 3;
+
+// Tiempo base (ms) equivalente al espacio de UNA caja de avance del
+// mecanismo. Calibrado de forma que, para el peor caso ya probado en campo
+// (inventario = 1 caja, el mecanismo debe recorrer 2 espacios vacios + la
+// caja = 3 unidades de espacio), el tiempo resultante coincide con el
+// valor fijo previamente calibrado (4200 ms): 1400 ms x 3 = 4200 ms.
+// Ajustar únicamente este valor si se recalibra el mecanismo.
+const unsigned long BASE_MECH_DISPENSE_TIME_MS = 2000;
+
+// Tiempo máximo de activación del mecanismo antes de obligar el retorno.
+// Ya NO es una constante fija: se recalcula en ejecutarCicloDeTrabajo()
+// según el inventario recibido por Serial. La máquina de estados del
+// mecanismo (updateMechStateMachine) sigue comparando contra esta misma
+// variable exactamente de la misma manera que antes.
+unsigned long MAX_MECH_DISPENSE_TIME_MS = BASE_MECH_DISPENSE_TIME_MS * MAX_CAJAS_POR_CELDA; // valor inicial por defecto
 
 // ============================================================
 // GLOBALS - CONVEYOR
@@ -406,6 +424,15 @@ void procesarBandaYMecanismo()
         {
             float calibratedDistance = filtered - CALIBRATION_OFFSET;
 
+            // Impresión de la medida del sensor de la banda (solo lectura,
+            // no afecta el filtrado ni la máquina de estados).
+            /*Serial.print("Sensor banda -> Filtrada: ");
+            Serial.print(filtered);
+            Serial.print(" mm | Calibrada: ");
+            Serial.print(calibratedDistance);
+            Serial.print(" mm | Estado: ");
+            Serial.println(stateName(currentState));*/
+
             // Actualizar estado de la banda
             updateStateMachine(calibratedDistance, now);
             applyMotorForState();
@@ -529,7 +556,7 @@ void irAHome() {
 //    banda, a que el mecanismo complete TODO su ciclo (Dispensando ->
 //    Retornando -> Idle). Solo entonces se ejecuta irAHome().
 //
-void ejecutarCicloDeTrabajo(float targetX, float targetY) {
+void ejecutarCicloDeTrabajo(float targetX, float targetY, uint8_t inventario) {
   habilitarMotores();
 
   long pasosX = targetX * PASOS_POR_MM;
@@ -540,6 +567,16 @@ void ejecutarCicloDeTrabajo(float targetX, float targetY) {
 
   esperarMovimiento();
   Serial.println("Posicion alcanzada. Iniciando dispensacion...");
+
+  // Tiempo máximo de avance del mecanismo, calculado dinámicamente según el
+  // inventario restante en la celda (ver BASE_MECH_DISPENSE_TIME_MS). La
+  // máquina de estados del mecanismo no cambia: sigue usando esta variable
+  // exactamente igual que antes, solo que ahora su valor es dinámico.
+  MAX_MECH_DISPENSE_TIME_MS = BASE_MECH_DISPENSE_TIME_MS * (MAX_CAJAS_POR_CELDA + 1 - inventario);
+  Serial.print("Inventario: "); Serial.print(inventario);
+  Serial.print(" caja(s) -> Tiempo maximo de dispensacion: ");
+  Serial.print(MAX_MECH_DISPENSE_TIME_MS);
+  Serial.println(" ms");
 
   // Disparo del mecanismo de dispensación (equivalente al comando 'A' del
   // programa original del conveyor)
@@ -577,16 +614,22 @@ void leerCeldaSerial() {
   String entrada = Serial.readStringUntil('\n');
   entrada.trim();
 
-  if (entrada.length() != 2) {
-    Serial.println("Error: Formato invalido. Use 2 digitos (Ej: 42)");
+  if (entrada.length() != 3) {
+    Serial.println("Error: Formato invalido. Use 3 digitos (Ej: 421 = Columna4,Fila2,Inventario1)");
     return;
   }
 
   int columna = entrada.charAt(0) - '0';
   int fila = entrada.charAt(1) - '0';
+  int inventario = entrada.charAt(2) - '0';
 
   if (fila < 1 || fila > FILAS || columna < 1 || columna > COLUMNAS) {
     Serial.println("Error: Celda fuera de rango (Filas: 1-5, Columnas: 1-6)");
+    return;
+  }
+
+  if (inventario < 1 || inventario > MAX_CAJAS_POR_CELDA) {
+    Serial.println("Error: Inventario invalido. Use 1, 2 o 3 cajas.");
     return;
   }
 
@@ -604,9 +647,10 @@ void leerCeldaSerial() {
 
   Serial.print("Comando recibido: "); Serial.print(entrada);
   Serial.print(" -> Moviendo a X: "); Serial.print(targetX);
-  Serial.print("mm, Y: "); Serial.print(targetY); Serial.println("mm");
+  Serial.print("mm, Y: "); Serial.print(targetY);
+  Serial.print("mm, Inventario: "); Serial.println(inventario);
 
-  ejecutarCicloDeTrabajo(targetX, targetY);
+  ejecutarCicloDeTrabajo(targetX, targetY, (uint8_t)inventario);
 }
 
 // ==========================================
@@ -701,7 +745,7 @@ void setup() {
   // PASO 1c: SISTEMA LISTO
   // ========================================================
   Serial.println("Sistema listo. Mecanismo y CNC en HOME.");
-  Serial.println("Ingrese la celda de 2 digitos (ColumnaFila).");
+  Serial.println("Ingrese el comando de 3 digitos (ColumnaFilaInventario). Ej: 421");
 }
 
 void loop() {
